@@ -1,0 +1,38 @@
+function doPost(e) {
+  const ss = SpreadsheetApp.getActive();
+  const sheet = ss.getSheetByName("dashboard");
+  const log = ss.getSheetByName("fault_log") || ss.insertSheet("fault_log");
+
+  const d = JSON.parse(e.postData.contents);
+d.dt =999;
+
+  sheet.getRange("B2").setValue(d.kw);
+  sheet.getRange("B3").setValue(d.time);
+  sheet.getRange("B4").setValue(d.pulsecount);
+  sheet.getRange("B5").setValue(d.dt);
+  sheet.getRange("B6").setValue(d.rssi);
+  sheet.getRange("B7").setValue(d.snr);
+
+  // ---- fault detection ----
+  let fault = "";
+
+  if (d.dt < 5 || d.dt > 120) fault = "BAD dt";
+  else if (d.kw < 0 || d.kw > 20) fault = "POWER OUT OF RANGE";
+  else if (d.snr !== null && d.snr < 10) fault = "LOW SNR";
+
+  if (fault) {
+    log.appendRow([
+      new Date(),
+      fault,
+      d.kw,
+      d.dt,
+      d.rssi,
+      d.snr
+    ]);
+    sheet.getRange("F2").setValue(true); // fault latch
+  }
+
+  return ContentService
+    .createTextOutput("OK")
+    .setMimeType(ContentService.MimeType.TEXT);
+}
