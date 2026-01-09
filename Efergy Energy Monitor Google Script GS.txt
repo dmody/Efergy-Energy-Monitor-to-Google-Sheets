@@ -1,0 +1,330 @@
+/* ==========================================================================
+   ENERGY MONITOR v5.3 (THE MASTER CUT)
+   - Features: LockService, Billing Cache, Full Batch Writing
+   - Logic: Kingston, Ontario TOU + Delivery + Rebates
+   ========================================================================== */
+
+function doPost(e) {
+  const lock = LockService.getPublicLock();
+  try {
+    // 1. Wait for lock to prevent "Zombie" ghost executions
+    lock.waitLock(5000); 
+    
+    const d = JSON.parse(e.postData.contents);
+    const ss = SpreadsheetApp.getActive(); 
+
+    /*===============================================================================
+      // DEBUG LOGing  - disable by commenting off if not required
+      const dbg = ss.getSheetByName("debug_ingest") || ss.insertSheet("debug_ingest");
+      if (dbg.getLastRow() > 200) dbg.deleteRow(2);
+      dbg.appendRow([new Date(), d.source || "", JSON.stringify(d)]);
+    ===============================================================================*/
+
+    // 2. DISPATCHER
+    if (d.source === "kasa") {
+      return handleKasaPower(d, ss); 
+    } else {
+      return handleHousePower(d, ss);
+    }
+
+  } catch (f) {
+    return ContentService.createTextOutput("Locked/Error").setMimeType(ContentService.MimeType.TEXT);
+  } finally {
+    SpreadsheetApp.flush(); // Force all pending changes to hit the sheet NOW
+    lock.releaseLock();     // Then let the next person in line start
+  }
+}
+
+/* ==================================================
+   DYNAMIC CONFIGURATION (WITH CACHING)
+   ================================================== */
+function getBillingConfig() {
+  const cache = CacheService.getScriptCache();
+  const cached = cache.get("billing_config_v2");
+  if (cached) return JSON.parse(cached);
+
+  const ss = SpreadsheetApp.getActive();
+  const sheet = ss.getSheetByName("Config");
+  let config = {
+    TOU: { LOW: 0.098, MID: 0.157, HIGH: 0.203 },
+    DELIVERY: { FIXED_MONTHLY: 38.50, VARIABLE_KWH: 0.055 },
+    REBATE_PCT: 0.235,
+    HOLIDAYS: ["01-01", "02-16", "03-29", "05-18", "07-01", "08-03", "09-07", "10-12", "12-25", "12-26"]
+  };
+
+  if (sheet) {
+    const v = sheet.getRange("B2:B7").getValues();
+    if (typeof v[0][0] === 'number') config.TOU.LOW = v[0][0];
+    if (typeof v[1][0] === 'number') config.TOU.MID = v[1][0];
+    if (typeof v[2][0] === 'number') config.TOU.HIGH = v[2][0];
+    if (typeof v[3][0] === 'number') config.DELIVERY.FIXED_MONTHLY = v[3][0];
+    if (typeof v[4][0] === 'number') config.DELIVERY.VARIABLE_KWH = v[4][0];
+    if (typeof v[5][0] === 'number') config.REBATE_PCT = v[5][0];
+  }
+  cache.put("billing_config_v2", JSON.stringify(config), 21600);
+  return config;
+}
+
+/* ==================================================
+   ONTARIO TOU LOGIC
+   ================================================== */
+function getOntarioTOU(dateObj) {
+  const config = getBillingConfig();
+  const h = dateObj.getHours();
+  const d = dateObj.getDay();
+  const m = dateObj.getMonth();
+  const dateStr = ("0" + (m + 1)).slice(-2) + "-" + ("0" + dateObj.getDate()).slice(-2);
+
+  if (d === 0 || d === 6 || config.HOLIDAYS.includes(dateStr)) return { level: "LOW", price: config.TOU.LOW };
+
+  const isWinter = (m >= 10 || m <= 3);
+  if (isWinter) {
+    if (h < 7 || h >= 19) return { level: "LOW", price: config.TOU.LOW };
+    if (h < 11 || (h >= 17 && h < 19)) return { level: "HIGH", price: config.TOU.HIGH };
+    return { level: "MID", price: config.TOU.MID };
+  } else {
+    if (h < 7 || h >= 19) return { level: "LOW", price: config.TOU.LOW };
+    if (h < 11 || (h >= 17 && h < 19)) return { level: "MID", price: config.TOU.MID };
+    return { level: "HIGH", price: config.TOU.HIGH };
+  }
+}
+
+/* ==================================================
+   HOUSE POWER HANDLER (BATCH OPTIMIZED)
+   ================================================== */
+function handleHousePower(d, ss) {
+  const dashSheet = ss.getSheetByName("dashboard");
+  const importSheet = ss.getSheetByName("Imports");
+  
+  let baseData = [null, null];
+  if (importSheet) { 
+    baseData = importSheet.getRange("A2:B2").getValues()[0]; 
+  }
+
+  const dashData = [[d.kw], [d.time], [d.pulsecount], [d.dt], [d.rssi], [d.snr], 
+                    [d.temp_c], [d.solar_w], [d.wind_mps], [d.freq], [d.rssi], 
+                    [d.humidity], [baseData[0]], [baseData[1]]];
+  
+  dashSheet.getRange("B2:B15").setValues(dashData);
+  dashSheet.getRange("H2").setValue(new Date(d.time)); 
+
+  const powerWatts = d.kw * 1000;
+  handle5MinLog(d, "house_main", "House Main", powerWatts, ss);
+  handleDailyLog(d, "house_main", "House Main", powerWatts, baseData[0], baseData[1], ss);
+  return handleHourlyLog(d, "house_main", "House Main", "power_hourly", powerWatts, baseData[0], baseData[1], ss);
+}
+
+/* ==================================================
+   KASA POWER HANDLER
+   ================================================== */
+function handleKasaPower(d, ss) {
+  const latestSheet = ss.getSheetByName("Kasa_latest") || ss.insertSheet("Kasa_latest");
+  const DEVICE_ID = String(d.mac || "").trim().toUpperCase().replace(/-/g, ":");
+
+  const lastRow = latestSheet.getLastRow();
+  let rowToUpdate = -1;
+  if (lastRow > 1) {
+    const macList = latestSheet.getRange(2, 2, lastRow - 1, 1).getValues();
+    for (let i = 0; i < macList.length; i++) {
+      if (String(macList[i][0]).toUpperCase() === DEVICE_ID) { rowToUpdate = i + 2; break; }
+    }
+  }
+
+  const rowData = [[new Date(d.time), d.mac, d.device, d.model, d.power_w, d.voltage_v, d.current_a, d.relay_on, d.rssi_dbm]];
+  if (rowToUpdate > 0) latestSheet.getRange(rowToUpdate, 1, 1, 9).setValues(rowData);
+  else latestSheet.appendRow(rowData[0]);
+
+  handle5MinLog(d, DEVICE_ID, d.device, d.power_w, ss);
+  handleDailyLog(d, DEVICE_ID, d.device, d.power_w, null, null, ss);
+  return handleHourlyLog(d, DEVICE_ID, d.device, "kasa_hourly", d.power_w, null, null, ss);
+}
+
+/* ==================================================
+   HOURLY LOG (BATCH OPTIMIZED)
+   ================================================== */
+function handleHourlyLog(d, deviceId, deviceName, sheetName, powerWatts, baseTemp, baseHum, ss) {
+  const hourlySheet = ss.getSheetByName(sheetName) || ss.insertSheet(sheetName);
+  const props = PropertiesService.getScriptProperties();
+  const COL_MAP = { "house_main": 4, "78:8C:B5:94:C3:AB": 13, "78:8C:B5:94:C7:1F": 18 };
+  
+  if (hourlySheet.getLastRow() === 0) {
+    hourlySheet.appendRow(["Local Time", "UTC Time", "Rate Level", "Device", "Energy (Wh)", "Cost ($)", "Avg W", "Min W", "Max W", "Quality", "Avg Freq", "Avg Signal", "Device", "Energy (Wh)", "Cost ($)", "Avg W", "Max W", "Device", "Energy (Wh)", "Cost ($)", "Avg W", "Max W", "Avg Temp", "Avg Hum", "Base Temp", "Base Hum"]);
+  }
+
+  const now = new Date(d.time);
+  const hourStart = new Date(now); hourStart.setMinutes(0,0,0,0);
+  const stateKey = "state_hr_" + deviceId;
+  let state = JSON.parse(props.getProperty(stateKey) || "{}");
+
+  if (state.hourKey && state.hourKey !== (deviceId + "_" + hourStart.toISOString())) {
+    const tou = getOntarioTOU(new Date(state.hourStartLocal));
+    const cost = (state.energy_wh / 1000) * tou.price;
+    const avgW = state.samples > 0 ? (state.power_sum / state.samples) : 0;
+    const startCol = COL_MAP[deviceId];
+
+    if (startCol) {
+      let rowToWrite = -1;
+      const lastRow = hourlySheet.getLastRow();
+      if (lastRow > 0) {
+        const times = hourlySheet.getRange(Math.max(1, lastRow-12), 1, Math.min(13, lastRow), 1).getValues();
+        for (let i = 0; i < times.length; i++) {
+          if (Math.abs(new Date(times[i][0]).getTime() - new Date(state.hourStartLocal).getTime()) < 1000) {
+            rowToWrite = (Math.max(1, lastRow-12)) + i + 1; break;
+          }
+        }
+      }
+      if (rowToWrite === -1) {
+        const newRow = new Array(26).fill(""); newRow[0] = new Date(state.hourStartLocal); newRow[2] = tou.level;
+        hourlySheet.appendRow(newRow); rowToWrite = hourlySheet.getLastRow();
+      }
+
+      if (deviceId === "house_main") {
+        hourlySheet.getRange(rowToWrite, startCol, 1, 9).setValues([[state.device_name, state.energy_wh, cost, avgW, state.min_power, state.max_power, "OK", (state.freq_sum/state.freq_samples), (state.sig_sum/state.sig_samples)]]);
+        hourlySheet.getRange(rowToWrite, 23, 1, 4).setValues([[(state.temp_sum/state.temp_samples), (state.hum_sum/state.hum_samples), (state.bt_sum/state.bt_samples), (state.bh_sum/state.bh_samples)]]);
+      } else {
+        hourlySheet.getRange(rowToWrite, startCol, 1, 5).setValues([[state.device_name, state.energy_wh, cost, avgW, state.max_power]]);
+      }
+    }
+    state = {}; // Clear for new hour
+  }
+
+  state.hourKey = deviceId + "_" + hourStart.toISOString();
+  state.hourStartLocal = hourStart;
+  state.device_name = deviceName || deviceId;
+  state.energy_wh = (state.energy_wh || 0) + powerWatts * ((now.getTime() - (state.last_ts || now.getTime())) / 3600000);
+  state.power_sum = (state.power_sum || 0) + powerWatts;
+  state.samples = (state.samples || 0) + 1;
+  state.min_power = Math.min(state.min_power || 99999, powerWatts);
+  state.max_power = Math.max(state.max_power || 0, powerWatts);
+  
+  if (d.temp_c) { state.temp_sum = (state.temp_sum || 0) + d.temp_c; state.temp_samples = (state.temp_samples || 0) + 1; }
+  if (d.humidity) { state.hum_sum = (state.hum_sum || 0) + d.humidity; state.hum_samples = (state.hum_samples || 0) + 1; }
+  if (baseTemp) { state.bt_sum = (state.bt_sum || 0) + Number(baseTemp); state.bt_samples = (state.bt_samples || 0) + 1; }
+  if (baseHum) { state.bh_sum = (state.bh_sum || 0) + Number(baseHum); state.bh_samples = (state.bh_samples || 0) + 1; }
+  if (d.freq) { state.freq_sum = (state.freq_sum || 0) + d.freq; state.freq_samples = (state.freq_samples || 0) + 1; }
+  const sig = d.rssi_dbm || d.rssi || d.battery_ok;
+  if (sig) { state.sig_sum = (state.sig_sum || 0) + sig; state.sig_samples = (state.sig_samples || 0) + 1; }
+
+  state.last_ts = now.getTime();
+  props.setProperty(stateKey, JSON.stringify(state));
+  return ContentService.createTextOutput("OK").setMimeType(ContentService.MimeType.TEXT);
+}
+
+/* ==================================================
+   5-MINUTE LOG (BATCH OPTIMIZED)
+   ================================================== */
+function handle5MinLog(d, deviceId, deviceName, powerWatts, ss) {
+  const sheet = ss.getSheetByName("power_5min") || ss.insertSheet("power_5min");
+  const props = PropertiesService.getScriptProperties();
+  const COL_MAP = { "house_main": 2, "78:8C:B5:94:C3:AB": 5, "78:8C:B5:94:C7:1F": 8 };
+  
+  const now = new Date(d.time);
+  const bucketStart = new Date(Math.floor(now.getTime() / 300000) * 300000);
+  const stateKey = "state_5min_" + deviceId;
+  let state = JSON.parse(props.getProperty(stateKey) || "{}");
+
+  if (state.bucketKey && state.bucketKey !== (deviceId + "_5min_" + bucketStart.getTime())) {
+    const avgPower = state.samples > 0 ? (state.power_sum / state.samples) : 0;
+    const startCol = COL_MAP[deviceId];
+
+    if (startCol) {
+      let rowToWrite = -1;
+      const lastRow = sheet.getLastRow();
+      if (lastRow > 1 && Math.abs(new Date(sheet.getRange(lastRow, 1).getValue()).getTime() - state.bucketStartTs) < 1000) rowToWrite = lastRow;
+
+      if (rowToWrite > 0) {
+        sheet.getRange(rowToWrite, startCol, 1, 3).setValues([[state.device_name, state.energy_wh, avgPower]]);
+        if (deviceId === "house_main") {
+           sheet.getRange(rowToWrite, 11, 1, 4).setValues([[(state.temp_sum/state.temp_samples), (state.hum_sum/state.hum_samples), (state.freq_sum/state.freq_samples), (state.sig_sum/state.sig_samples)]]);
+        }
+      } else {
+        const newRow = new Array(14).fill(""); newRow[0] = new Date(state.bucketStartTs);
+        newRow[startCol-1] = state.device_name; newRow[startCol] = state.energy_wh; newRow[startCol+1] = avgPower;
+        sheet.appendRow(newRow);
+      }
+    }
+    if (sheet.getLastRow() > 600) sheet.deleteRows(2, sheet.getLastRow() - 600);
+  }
+  state.bucketKey = deviceId + "_5min_" + bucketStart.getTime();
+  state.bucketStartTs = bucketStart.getTime();
+  state.device_name = deviceName || deviceId;
+  state.energy_wh = (state.energy_wh || 0) + powerWatts * ((now.getTime() - (state.last_ts || now.getTime())) / 3600000);
+  state.power_sum = (state.power_sum || 0) + powerWatts;
+  state.samples = (state.samples || 0) + 1;
+  if (d.temp_c) { state.temp_sum = (state.temp_sum || 0) + d.temp_c; state.temp_samples = (state.temp_samples || 0) + 1; }
+  if (d.humidity) { state.hum_sum = (state.hum_sum || 0) + d.humidity; state.hum_samples = (state.hum_samples || 0) + 1; }
+  if (d.freq) { state.freq_sum = (state.freq_sum || 0) + d.freq; state.freq_samples = (state.freq_samples || 0) + 1; }
+  const sig = d.rssi_dbm || d.rssi || d.battery_ok;
+  if (sig) { state.sig_sum = (state.sig_sum || 0) + sig; state.sig_samples = (state.sig_samples || 0) + 1; }
+  state.last_ts = now.getTime();
+  props.setProperty(stateKey, JSON.stringify(state));
+}
+
+/* ==================================================
+   DAILY SUMMARY LOG (BATCH OPTIMIZED)
+   ================================================== */
+function handleDailyLog(d, deviceId, deviceName, powerWatts, baseTemp, baseHum, ss) {
+  const config = getBillingConfig();
+  const sheet = ss.getSheetByName("power_daily") || ss.insertSheet("power_daily");
+  const props = PropertiesService.getScriptProperties();
+  const COL_MAP = { "house_main": 2, "78:8C:B5:94:C3:AB": 11, "78:8C:B5:94:C7:1F": 17 };
+
+  const now = new Date(d.time);
+  const dayStr = now.toLocaleDateString("en-CA");
+  const stateKey = "state_day_" + deviceId;
+  let state = JSON.parse(props.getProperty(stateKey) || "{}");
+
+  if (state.bucketKey && state.bucketKey !== (deviceId + "_daily_" + dayStr)) {
+    const kwhL = state.e_low/3600000; const kwhM = state.e_mid/3600000; const kwhH = state.e_high/3600000;
+    const totKwh = kwhL+kwhM+kwhH;
+    const sub = (kwhL*config.TOU.LOW) + (kwhM*config.TOU.MID) + (kwhH*config.TOU.HIGH) + (totKwh*config.DELIVERY.VARIABLE_KWH) + (config.DELIVERY.FIXED_MONTHLY/30);
+    const cost = sub - (sub * config.REBATE_PCT);
+    const startCol = COL_MAP[deviceId];
+
+    if (startCol) {
+      let rowToWrite = -1;
+      const lastRow = sheet.getLastRow();
+      if (lastRow > 0) {
+        const dates = sheet.getRange(Math.max(1, lastRow-5), 1, Math.min(6, lastRow), 1).getDisplayValues();
+        for (let i=0; i<dates.length; i++) { if (dates[i][0] === state.dayString) { rowToWrite = (Math.max(1, lastRow-5)) + i; break; } }
+      }
+      if (rowToWrite === -1) { sheet.appendRow([state.dayString]); rowToWrite = sheet.getLastRow(); }
+
+      if (deviceId === "house_main") {
+        sheet.getRange(rowToWrite, startCol, 1, 9).setValues([[state.device_name, totKwh, cost, kwhL/1000, kwhM/1000, kwhH/1000, (state.power_sum/state.samples), (state.sig_sum/state.sig_samples), "OK"]]);
+        sheet.getRange(rowToWrite, 23, 1, 6).setValues([[(state.temp_sum/state.temp_samples), state.min_t, state.max_t, (state.hum_sum/state.hum_samples), (state.bt_sum/state.bt_samples), (state.bh_sum/state.bh_samples)]]);
+      } else {
+        const mins = (state.active_s/60).toFixed(0);
+        sheet.getRange(rowToWrite, startCol, 1, 6).setValues([[state.device_name, totKwh, cost, mins, "OK", state.max_power]]);
+      }
+    }
+    state = {};
+  }
+
+  const tou = getOntarioTOU(now);
+  state.bucketKey = deviceId + "_daily_" + dayStr;
+  state.dayString = dayStr;
+  state.device_name = deviceName || deviceId;
+  const dt = (now.getTime() - (state.last_ts || now.getTime())) / 1000;
+  const energyWs = powerWatts * dt;
+  if (tou.level === "HIGH") state.e_high = (state.e_high || 0) + energyWs;
+  else if (tou.level === "MID") state.e_mid = (state.e_mid || 0) + energyWs;
+  else state.e_low = (state.e_low || 0) + energyWs;
+  
+  state.power_sum = (state.power_sum || 0) + powerWatts;
+  state.samples = (state.samples || 0) + 1;
+  if (powerWatts > 2.0) state.active_s = (state.active_s || 0) + dt;
+  state.max_power = Math.max(state.max_power || 0, powerWatts);
+  if (d.temp_c) {
+    state.temp_sum = (state.temp_sum || 0) + d.temp_c; state.temp_samples = (state.temp_samples || 0) + 1;
+    state.min_t = Math.min(state.min_t || 99, d.temp_c); state.max_t = Math.max(state.max_t || -99, d.temp_c);
+  }
+  if (d.humidity) { state.hum_sum = (state.hum_sum || 0) + d.humidity; state.hum_samples = (state.hum_samples || 0) + 1; }
+  if (baseTemp) { state.bt_sum = (state.bt_sum || 0) + Number(baseTemp); state.bt_samples = (state.bt_samples || 0) + 1; }
+  if (baseHum) { state.bh_sum = (state.bh_sum || 0) + Number(baseHum); state.bh_samples = (state.bh_samples || 0) + 1; }
+  const sig = d.rssi_dbm || d.rssi || d.battery_ok;
+  if (sig) { state.sig_sum = (state.sig_sum || 0) + sig; state.sig_samples = (state.sig_samples || 0) + 1; }
+
+  state.last_ts = now.getTime();
+  props.setProperty(stateKey, JSON.stringify(state));
+}

@@ -1,0 +1,22 @@
+[Unit]
+Description=Efergy Optical Power Monitor → Google Sheets
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=GS_POST_URL=https://script.google.com/macros/s/YOUR_GOOGLE_SCRIPT_ID/exec
+ExecStart=/bin/bash -c '/usr/bin/rtl_433 -f 433.5M:433.58M -g 15 -F json -M time -M level | /usr/bin/python3 /home/pi/powerpi/efergy_to_sheets.py'
+Restart=always
+RestartSec=10
+Nice=10
+NoNewPrivileges=true
+User=pi
+WorkingDirectory=/home/pi
+
+# keep logs accessible but bounded
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
