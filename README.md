@@ -23,5 +23,7 @@ In the end it took me s 4 or 5 days of work and maybe something here will save y
 
 I know have what I consider to be a fairly handy little dashboard and data historian, and I have some thoughts on how to extend this into not just a monitor that you set and forget about.... stay tuned.  
 
+The ..."Demo V1" files for the Raspberry Pi and Google sheets are a minimimum to get you going and you can see how easy this is to get working.  Well, easy once you have a million libraries installed on the PI, but otherwise easy.  
+
 Cheers,
 Dave
