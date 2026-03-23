@@ -89,18 +89,35 @@ function getOntarioTOU(dateObj) {
 function handleHousePower(d, ss) {
   const dashSheet = ss.getSheetByName("dashboard");
   const importSheet = ss.getSheetByName("Imports");
-  
+
   let baseData = [null, null];
-  if (importSheet) { 
-    baseData = importSheet.getRange("A2:B2").getValues()[0]; 
+  if (importSheet) {
+    baseData = importSheet.getRange("A2:B2").getValues()[0];
   }
 
-  const dashData = [[d.kw], [d.time], [d.pulsecount], [d.dt], [d.rssi], [d.snr], 
-                    [d.temp_c], [d.solar_w], [d.wind_mps], [d.freq], [d.rssi], 
+  /* --- Furnace / indoor sensor staleness detection --- */
+  const props = PropertiesService.getScriptProperties();
+  const prevImport = JSON.parse(props.getProperty("prev_import") || "{}");
+  const nowMs = new Date(d.time).getTime();
+  const curTemp = baseData[0], curHum = baseData[1];
+
+  if (curTemp != prevImport.temp || curHum != prevImport.hum) {
+    // values changed → sensor is alive, record timestamp
+    props.setProperty("prev_import", JSON.stringify({ temp: curTemp, hum: curHum, ts: nowMs }));
+    dashSheet.getRange("H3").setValue(new Date(nowMs));       // "Import last changed"
+    dashSheet.getRange("H4").setValue("");                     // clear stale warning
+  } else if (prevImport.ts) {
+    const ageMins = (nowMs - prevImport.ts) / 60000;
+    dashSheet.getRange("H3").setValue(new Date(prevImport.ts));
+    dashSheet.getRange("H4").setValue(ageMins >= 10 ? "STALE (" + Math.round(ageMins) + " min)" : "");
+  }
+
+  const dashData = [[d.kw], [d.time], [d.pulsecount], [d.dt], [d.rssi], [d.snr],
+                    [d.temp_c], [d.solar_w], [d.wind_mps], [d.freq], [d.rssi],
                     [d.humidity], [baseData[0]], [baseData[1]]];
-  
+
   dashSheet.getRange("B2:B15").setValues(dashData);
-  dashSheet.getRange("H2").setValue(new Date(d.time)); 
+  dashSheet.getRange("H2").setValue(new Date(d.time));
 
   const powerWatts = d.kw * 1000;
   handle5MinLog(d, "house_main", "House Main", powerWatts, ss);
