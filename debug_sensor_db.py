@@ -88,7 +88,7 @@ def inspect_database(db_path):
         if time_cols:
             tc = time_cols[0]
             # Most recent entry
-            cur.execute(f"SELECT * FROM '{table}' ORDER BY '{tc}' DESC LIMIT 5")
+            cur.execute(f'SELECT * FROM "{table}" ORDER BY "{tc}" DESC LIMIT 5')
             rows = cur.fetchall()
             print(f"\n  Last 5 entries (ordered by {tc}):")
             for row in rows:
@@ -117,7 +117,7 @@ def inspect_database(db_path):
             # Count entries in last 24h (best effort)
             try:
                 cur.execute(
-                    f"SELECT COUNT(*) FROM '{table}' WHERE '{tc}' > datetime('now', '-1 day')"
+                    f'SELECT COUNT(*) FROM "{table}" WHERE "{tc}" > strftime(\'%s\', \'now\', \'-1 day\')'
                 )
                 recent = cur.fetchone()[0]
                 print(f"  Rows in last 24h (datetime compare): {recent}")
